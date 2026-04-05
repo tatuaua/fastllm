@@ -212,9 +212,9 @@ func (*bearerAuthResolver) ResolveAuthSchemes(_ context.Context, _ *bedrockrunti
 
 // buildSystemPrompt constructs the system instruction for the LLM.
 func buildSystemPrompt(history string, originalRequest string) string {
-	var commandList string
+	var commandList strings.Builder
 	for cmd, desc := range availableCommands {
-		commandList += fmt.Sprintf("- %s: %s\n", cmd, desc)
+		fmt.Fprintf(&commandList, "- %s: %s\n", cmd, desc)
 	}
 
 	return "You are a senior software engineer and coding agent. Your task is to fulfill the user's request " +
@@ -236,7 +236,7 @@ func buildSystemPrompt(history string, originalRequest string) string {
 		"For writefile, put the path then a newline then the content. Example:\n" +
 		"  {\"c\":\"writefile temp/main.go\\npackage main\\n\\nimport \\\"fmt\\\"\\n\\nfunc main() {\\n\\tfmt.Println(\\\"hello\\\")\\n}\"}\n" +
 		"Use writelines only for surgical line-range edits.\n" +
-		"Available commands:\n" + commandList +
+		"Available commands:\n" + commandList.String() +
 		"Do not output anything other than the JSON object.\n" +
 		"Session history:\n" + history
 }

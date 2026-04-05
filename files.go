@@ -66,7 +66,7 @@ func isPlainText(filePath string) (bool, error) {
 		return false, err
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		b := buf[i]
 		if b == 0 {
 			return false, nil

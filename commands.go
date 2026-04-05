@@ -304,7 +304,7 @@ func countRemainingMatches(pattern, currentFile string, remainingLines []string,
 		if !started {
 			continue
 		}
-		for _, line := range strings.Split(content, "\n") {
+		for line := range strings.SplitSeq(content, "\n") {
 			if strings.Contains(line, pattern) {
 				count++
 			}
