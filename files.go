@@ -23,7 +23,7 @@ func BuildPathMap() map[string]string {
 			return err
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" || d.Name() == "node_modules" {
+			if d.Name() == ".git" || d.Name() == "node_modules" || d.Name() == "bubbletea" {
 				return filepath.SkipDir
 			}
 			return nil

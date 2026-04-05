@@ -5,38 +5,81 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	smithyauth "github.com/aws/smithy-go/auth"
+	"github.com/aws/smithy-go/auth/bearer"
 )
 
 const (
-	modelID      = "eu.amazon.nova-micro-v1:0"
+	modelID      = "eu.amazon.nova-pro-v1:0"
 	maxLoopSteps = 20
 )
 
+// ToolExec records a single tool call and its result for multi-command prompts.
+type ToolExec struct {
+	Call   string `json:"call"`
+	Result string `json:"result"`
+}
+
 // Prompt is the structured input sent to the LLM.
 type Prompt struct {
-	UserPrompt string   `json:"user_prompt"`
-	Paths      []string `json:"existing_paths"`
+	UserPrompt string     `json:"user_prompt,omitempty"`
+	ToolCalls  []ToolExec `json:"tool_calls,omitempty"`
+	Paths      []string   `json:"existing_paths"`
 }
 
-// LLMResponse is the JSON structure returned by the LLM.
-type LLMResponse struct {
-	Command string `json:"c"`
+// llmResponse is the raw JSON structure returned by the LLM.
+// The "c" field can be either a single string or an array of strings.
+type llmResponse struct {
+	Commands json.RawMessage `json:"c"`
 }
 
-// ResponseMsg carries the LLM's command string back through Bubble Tea.
+// parseCommands extracts one or more command strings from the raw JSON "c" field.
+func (r *llmResponse) parseCommands() []string {
+	// Try array first (fast path for batch).
+	var arr []string
+	if err := json.Unmarshal(r.Commands, &arr); err == nil {
+		return arr
+	}
+	// Fall back to single string.
+	var single string
+	if err := json.Unmarshal(r.Commands, &single); err == nil {
+		return []string{single}
+	}
+	logf("[llm] Failed to parse commands field: %s", string(r.Commands))
+	return nil
+}
+
+// Message types sent via the update channel.
+
+// ResponseMsg carries the LLM's final answer.
 type ResponseMsg string
 
-// converseCmd returns a tea.Cmd that runs the agent loop in the background.
-// The LLM is called repeatedly — executing tool commands and feeding results
-// back — until it issues a "respond" command with a final answer.
-func (m model) converseCmd() tea.Cmd {
+// ToolCallMsg reports a single tool execution to the UI.
+type ToolCallMsg struct {
+	Command string
+	Result  string
+}
+
+// AgentDoneMsg signals the agent loop has finished.
+type AgentDoneMsg struct{}
+
+// waitForUpdate returns a tea.Cmd that blocks until the next message arrives on ch.
+func waitForUpdate(ch <-chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		return <-ch
+	}
+}
+
+// converseCmd returns a tea.Cmd that starts the agent loop and yields the
+// first intermediate message. Subsequent messages are pulled via waitForUpdate.
+func (m *model) converseCmd() tea.Cmd {
 	paths := make([]string, 0, len(m.pathMap))
 	for p := range m.pathMap {
 		paths = append(paths, p)
@@ -47,46 +90,69 @@ func (m model) converseCmd() tea.Cmd {
 		Paths:      paths,
 	}
 
-	history := m.history
-	pathMap := m.pathMap // shared map reference
+	history := m.rawHistory
+	pathMap := m.pathMap
 
-	return func() tea.Msg {
-		return runAgentLoop(prompt, history, pathMap)
-	}
+	ch := make(chan tea.Msg, 64)
+	m.updates = ch
+
+	go runAgentLoop(prompt, history, pathMap, ch)
+
+	return waitForUpdate(ch)
 }
 
-// runAgentLoop calls the LLM in a loop, executing tool commands and feeding
-// results back, until the LLM sends a "respond" command or the step limit is
-// reached.
-func runAgentLoop(prompt Prompt, history string, pathMap map[string]string) tea.Msg {
+// runAgentLoop calls the LLM in a loop, executing tool commands and sending
+// intermediate ToolCallMsg updates via ch. When done, sends ResponseMsg + AgentDoneMsg.
+func runAgentLoop(prompt Prompt, history string, pathMap map[string]string, ch chan<- tea.Msg) {
+	defer func() { ch <- AgentDoneMsg{} }()
+
+	originalRequest := prompt.UserPrompt
+
 	for step := range maxLoopSteps {
-		resp := callLLM(prompt, history)
-		raw := string(resp)
-		command, _, _ := strings.Cut(raw, " ")
+		commands := callLLM(prompt, history, originalRequest)
 
-		logf("[loop] Step %d: command=%q", step+1, command)
+		logf("[loop] Step %d: %d command(s)", step+1, len(commands))
 
-		if command == CommandRespond {
-			_, arg, _ := strings.Cut(raw, " ")
-			return ResponseMsg(arg)
+		var toolExecs []ToolExec
+		seen := make(map[string]bool)
+
+		for _, raw := range commands {
+			cmd, arg := splitCommand(raw)
+
+			if cmd == CommandRespond {
+				ch <- ResponseMsg(arg)
+				return
+			}
+
+			// Skip duplicate commands in the same batch.
+			if seen[raw] {
+				logf("[loop] Skipping duplicate command: %s", raw)
+				continue
+			}
+			seen[raw] = true
+
+			result := execCommand(raw, pathMap)
+			ch <- ToolCallMsg{Command: raw, Result: result}
+			toolExecs = append(toolExecs, ToolExec{Call: raw, Result: result})
 		}
 
-		result := execCommand(raw, pathMap)
-		history += fmt.Sprintf("tool_call: %s\ntool_result: %s\n", raw, result)
-
-		// Refresh paths in case createfile added a new entry.
-		prompt.Paths = make([]string, 0, len(pathMap))
+		// Build follow-up prompt with all tool results.
+		paths := make([]string, 0, len(pathMap))
 		for p := range pathMap {
-			prompt.Paths = append(prompt.Paths, p)
+			paths = append(paths, p)
+		}
+		prompt = Prompt{
+			ToolCalls: toolExecs,
+			Paths:     paths,
 		}
 	}
 
 	logf("[loop] Reached max steps (%d), forcing stop", maxLoopSteps)
-	return ResponseMsg("I ran out of steps before completing the task.")
+	ch <- ResponseMsg("I ran out of steps before completing the task.")
 }
 
-// callLLM sends a single prompt to AWS Bedrock and returns the parsed command.
-func callLLM(prompt Prompt, history string) ResponseMsg {
+// callLLM sends a single prompt to AWS Bedrock and returns the parsed command(s).
+func callLLM(prompt Prompt, history string, originalRequest string) []string {
 	promptJSON, err := json.Marshal(prompt)
 	if err != nil {
 		log.Fatalf("failed to marshal prompt to JSON: %v", err)
@@ -95,14 +161,20 @@ func callLLM(prompt Prompt, history string) ResponseMsg {
 
 	ctx := context.TODO()
 
-	cfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		log.Fatalf("unable to load SDK config: %v", err)
+	apiKey := os.Getenv("BEDROCK_API_KEY")
+	if apiKey == "" {
+		log.Fatal("BEDROCK_API_KEY environment variable is not set")
 	}
 
-	client := bedrockruntime.NewFromConfig(cfg)
+	client := bedrockruntime.New(bedrockruntime.Options{
+		Region: os.Getenv("AWS_REGION"),
+		BearerAuthTokenProvider: bearer.StaticTokenProvider{
+			Token: bearer.Token{Value: apiKey},
+		},
+		AuthSchemeResolver: &bearerAuthResolver{},
+	})
 
-	systemPrompt := buildSystemPrompt(history)
+	systemPrompt := buildSystemPrompt(history, originalRequest)
 
 	input := &bedrockruntime.ConverseInput{
 		ModelId: aws.String(modelID),
@@ -129,42 +201,89 @@ func callLLM(prompt Prompt, history string) ResponseMsg {
 	return parseConverseOutput(output)
 }
 
+// bearerAuthResolver forces the SDK to use bearer token auth (Bedrock API keys).
+type bearerAuthResolver struct{}
+
+func (*bearerAuthResolver) ResolveAuthSchemes(_ context.Context, _ *bedrockruntime.AuthResolverParameters) ([]*smithyauth.Option, error) {
+	return []*smithyauth.Option{
+		{SchemeID: "smithy.api#httpBearerAuth"},
+	}, nil
+}
+
 // buildSystemPrompt constructs the system instruction for the LLM.
-func buildSystemPrompt(history string) string {
+func buildSystemPrompt(history string, originalRequest string) string {
 	var commandList string
 	for cmd, desc := range availableCommands {
 		commandList += fmt.Sprintf("- %s: %s\n", cmd, desc)
 	}
 
-	return "You are a senior system admin and your task is to provide custom commands " +
-		"based on the context and prompt given to you.\n" +
-		"The 'existing_paths' field contains existing paths to files and directories.\n" +
-		"You must only output a JSON object in the following format: {\"c\":\"your command here\"}\n" +
-		"Ensure commands are syntactically correct with proper spacing between commands and arguments.\n" +
-		"Only output one command at a time.\n" +
+	return "You are a senior software engineer and coding agent. Your task is to fulfill the user's request " +
+		"by using the available tool commands.\n" +
+		"The user's original request: " + originalRequest + "\n" +
+		"Use tool commands to gather information and make changes, then use 'respond' with your final answer.\n" +
+		"The 'existing_paths' field lists all files and directories in the workspace.\n" +
+		"IMPORTANT RULES:\n" +
+		"- Use forward slashes in paths (e.g. temp/main.go, not temp\\\\main.go).\n" +
+		"- Do NOT wrap command arguments in quotes. Write: grep package main, NOT: grep 'package main'.\n" +
+		"- For questions, explanations, or conversational messages, use 'respond' immediately. Do NOT create files for explanations.\n" +
+		"- Do NOT repeat commands that already succeeded in previous steps.\n" +
+		"- Do NOT use createfile. Use writefile to create OR overwrite files in one step.\n" +
+		"You must output a JSON object with a \"c\" field containing commands.\n" +
+		"You may batch multiple independent commands in one response for speed:\n" +
+		"  Single: {\"c\":\"readfile main.go\"}\n" +
+		"  Batch:  {\"c\":[\"readlines main.go 1 20\",\"readlines go.mod 1 10\"]}\n" +
+		"When batching, commands run in order. Do NOT batch commands that depend on each other's results.\n" +
+		"For writefile, put the path then a newline then the content. Example:\n" +
+		"  {\"c\":\"writefile temp/main.go\\npackage main\\n\\nimport \\\"fmt\\\"\\n\\nfunc main() {\\n\\tfmt.Println(\\\"hello\\\")\\n}\"}\n" +
+		"Use writelines only for surgical line-range edits.\n" +
 		"Available commands:\n" + commandList +
-		"Do not output anything other than the JSON object." +
+		"Do not output anything other than the JSON object.\n" +
 		"Session history:\n" + history
 }
 
-// parseConverseOutput extracts the command from the Bedrock Converse response.
-func parseConverseOutput(output *bedrockruntime.ConverseOutput) ResponseMsg {
-	var resp LLMResponse
+// sanitizeJSON fixes common invalid JSON produced by LLMs:
+// - \<newline> (backslash continuation) -> <newline>
+// - \' (invalid escape) -> '
+// - strips markdown code fences wrapping JSON
+func sanitizeJSON(s string) string {
+	// Strip markdown code fences (```json ... ```).
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		if i := strings.Index(s, "\n"); i >= 0 {
+			s = s[i+1:]
+		}
+		s = strings.TrimSuffix(strings.TrimSpace(s), "```")
+		s = strings.TrimSpace(s)
+	}
+	// Replace backslash-continuation (\ followed by newline) with just newline.
+	s = strings.ReplaceAll(s, "\\\n", "\n")
+	s = strings.ReplaceAll(s, "\\\r\n", "\r\n")
+	// Replace invalid \' escape with literal '.
+	s = strings.ReplaceAll(s, `\'`, `'`)
+	return s
+}
 
+// parseConverseOutput extracts command(s) from the Bedrock Converse response.
+func parseConverseOutput(output *bedrockruntime.ConverseOutput) []string {
 	msg, ok := output.Output.(*types.ConverseOutputMemberMessage)
 	if !ok {
 		logf("Unexpected output type received.")
-		return ""
+		return nil
 	}
 
 	for _, content := range msg.Value.Content {
 		if textBlock, ok := content.(*types.ContentBlockMemberText); ok {
 			logf("[llm] Raw response: %s", textBlock.Value)
-			if err := json.Unmarshal([]byte(textBlock.Value), &resp); err != nil {
-				log.Fatalf("failed to unmarshal response JSON: %v", err)
+			raw := sanitizeJSON(textBlock.Value)
+			var resp llmResponse
+			if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+				logf("[llm] Failed to unmarshal response JSON: %v", err)
+				// Return a respond command so the agent loop terminates gracefully.
+				return []string{CommandRespond + " I encountered a response parsing error. Please try again."}
 			}
+			return resp.parseCommands()
 		}
 	}
 
-	return ResponseMsg(resp.Command)
+	return nil
 }
