@@ -55,13 +55,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "enter":
 			m.history += "user: " + m.textInput.Value() + "\n"
-			result := m.callConverse()
+			cmd := m.converseCmd()
 			m.textInput.SetValue("")
-			return m, result
+			return m, cmd
 		}
 
 	case ResponseMsg:
-		m.ExecCommand(string(msg))
 		m.response = string(msg)
 		m.history += "agent: " + m.response + "\n"
 		return m, nil
@@ -74,20 +73,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.textInput, cmd = m.textInput.Update(msg)
 	return m, cmd
-}
-
-func (m model) callConverse() tea.Cmd {
-	var paths []string
-	for path := range m.pathMap {
-		paths = append(paths, path)
-	}
-	prompt := Prompt{
-		UserPrompt: m.textInput.Value(),
-		Paths:      paths,
-	}
-	return func() tea.Msg {
-		return m.CallConverse(prompt)
-	}
 }
 
 func (m model) View() tea.View {
