@@ -29,9 +29,9 @@ type ToolExec struct {
 
 // Prompt is the structured input sent to the LLM.
 type Prompt struct {
-	UserPrompt string     `json:"user_prompt,omitempty"`
-	ToolCalls  []ToolExec `json:"tool_calls,omitempty"`
-	Paths      []string   `json:"existing_paths"`
+	UserPrompt string         `json:"user_prompt,omitempty"`
+	ToolCalls  []ToolExec     `json:"tool_calls,omitempty"`
+	Paths      map[string]int `json:"existing_paths"`
 }
 
 // llmResponse is the raw JSON structure returned by the LLM.
@@ -80,14 +80,9 @@ func waitForUpdate(ch <-chan tea.Msg) tea.Cmd {
 // converseCmd returns a tea.Cmd that starts the agent loop and yields the
 // first intermediate message. Subsequent messages are pulled via waitForUpdate.
 func (m *model) converseCmd() tea.Cmd {
-	paths := make([]string, 0, len(m.pathMap))
-	for p := range m.pathMap {
-		paths = append(paths, p)
-	}
-
 	prompt := Prompt{
 		UserPrompt: m.textInput.Value(),
-		Paths:      paths,
+		Paths:      buildPathLengths(m.pathMap),
 	}
 
 	history := m.rawHistory
@@ -136,14 +131,9 @@ func runAgentLoop(prompt Prompt, history string, pathMap map[string]string, ch c
 			toolExecs = append(toolExecs, ToolExec{Call: raw, Result: result})
 		}
 
-		// Build follow-up prompt with all tool results.
-		paths := make([]string, 0, len(pathMap))
-		for p := range pathMap {
-			paths = append(paths, p)
-		}
 		prompt = Prompt{
 			ToolCalls: toolExecs,
-			Paths:     paths,
+			Paths:     buildPathLengths(pathMap),
 		}
 	}
 
@@ -210,6 +200,19 @@ func (*bearerAuthResolver) ResolveAuthSchemes(_ context.Context, _ *bedrockrunti
 	}, nil
 }
 
+// buildPathLengths returns a map of file paths to their line counts.
+func buildPathLengths(pathMap map[string]string) map[string]int {
+	m := make(map[string]int, len(pathMap))
+	for path, content := range pathMap {
+		if content == "" {
+			m[path] = 0
+		} else {
+			m[path] = strings.Count(content, "\n") + 1
+		}
+	}
+	return m
+}
+
 // buildSystemPrompt constructs the system instruction for the LLM.
 func buildSystemPrompt(history string, originalRequest string) string {
 	var commandList strings.Builder
@@ -221,13 +224,16 @@ func buildSystemPrompt(history string, originalRequest string) string {
 		"by using the available tool commands.\n" +
 		"The user's original request: " + originalRequest + "\n" +
 		"Use tool commands to gather information and make changes, then use 'respond' with your final answer.\n" +
-		"The 'existing_paths' field lists all files and directories in the workspace.\n" +
+		"The 'existing_paths' field maps each file path to its line count.\n" +
 		"IMPORTANT RULES:\n" +
 		"- Use forward slashes in paths (e.g. temp/main.go, not temp\\\\main.go).\n" +
-		"- Do NOT wrap command arguments in quotes. Write: grep package main, NOT: grep 'package main'.\n" +
+		"- Do NOT wrap command arguments in quotes. Write: findfile package main, NOT: findfile 'package main'.\n" +
 		"- For questions, explanations, or conversational messages, use 'respond' immediately. Do NOT create files for explanations.\n" +
 		"- Do NOT repeat commands that already succeeded in previous steps.\n" +
 		"- Do NOT use createfile. Use writefile to create OR overwrite files in one step.\n" +
+		"- PREFER findfile and readlines over readfile. Only use readfile on small files (under 50 lines). " +
+		"For larger files, use findfile to find relevant lines, then readlines to read specific sections. " +
+		"You can scope findfile to a single file: 'findfile <pattern> <path>'.\n" +
 		"You must output a JSON object with a \"c\" field containing commands.\n" +
 		"You may batch multiple independent commands in one response for speed:\n" +
 		"  Single: {\"c\":\"readfile main.go\"}\n" +

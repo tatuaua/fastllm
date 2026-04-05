@@ -12,3 +12,5 @@ Always prioritize performance and speed of response to the user.
 Use modern golang features.
 
 Always read fastllm.log when debugging.
+
+When adding new logic, add unit tests.

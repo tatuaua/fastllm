@@ -14,10 +14,10 @@ const (
 	CommandReadLines  = "readlines"
 	CommandWriteFile  = "writefile"
 	CommandWriteLines = "writelines"
-	CommandGrep       = "grep"
+	CommandFindFile   = "findfile"
 	CommandRespond    = "respond"
 
-	maxGrepResults = 50
+	maxFindFileResults = 50
 )
 
 var availableCommands = map[string]string{
@@ -26,7 +26,7 @@ var availableCommands = map[string]string{
 	CommandReadLines:  "Read specific lines from a file (1-indexed, inclusive). Usage: 'readlines <path> <startLine> <endLine>'",
 	CommandWriteFile:  "Write entire file content (creates or overwrites). First line is path, rest is content. Usage: 'writefile <path>\\n<content>'",
 	CommandWriteLines: "Replace lines in a file (1-indexed). Usage: 'writelines <path> <startLine> <endLine>\\n<content>'",
-	CommandGrep:       "Search all files for a text pattern. Returns file:line:content matches (max 50). Usage: 'grep <pattern>'",
+	CommandFindFile:   "Search for a text pattern. Optionally scope to one file. Returns file:line:content matches (max 50). Usage: 'findfile <somestring>' or 'findfile <somestring> <path>'",
 	CommandRespond:    "Return final answer to the user. Usage: 'respond <message>'",
 }
 
@@ -108,8 +108,8 @@ func execCommand(raw string, pathMap map[string]string) string {
 		return execWriteFile(raw, pathMap)
 	case CommandWriteLines:
 		return execWriteLines(raw, pathMap)
-	case CommandGrep:
-		return execGrep(arg, pathMap)
+	case CommandFindFile:
+		return execFindFile(arg, pathMap)
 	case CommandRespond:
 		return arg
 	default:
@@ -260,30 +260,61 @@ func execWriteLines(raw string, pathMap map[string]string) string {
 	return fmt.Sprintf("wrote %d lines to %s (replaced lines %d-%d)", len(newLines), key, start, end)
 }
 
-func execGrep(pattern string, pathMap map[string]string) string {
-	if pattern == "" {
-		return "error: usage: grep <pattern>"
+// splitFindFileArg splits the FindFile argument into a pattern and an optional file
+// path. If the last space-separated token resolves to a file in pathMap, it
+// is treated as a file scope; otherwise the entire arg is the pattern.
+func splitFindFileArg(arg string, pathMap map[string]string) (pattern, file string) {
+	lastSpace := strings.LastIndex(arg, " ")
+	if lastSpace > 0 {
+		candidate := arg[lastSpace+1:]
+		if _, ok := resolvePath(candidate, pathMap); ok {
+			return arg[:lastSpace], candidate
+		}
 	}
+	return arg, ""
+}
+
+func execFindFile(arg string, pathMap map[string]string) string {
+	if arg == "" {
+		return "error: usage: findfile <string> [path]"
+	}
+
+	pattern, scopeFile := splitFindFileArg(arg, pathMap)
+
 	var b strings.Builder
 	count := 0
-	for file, content := range pathMap {
+
+	searchFile := func(file, content string) bool {
 		lines := strings.Split(content, "\n")
 		for i, line := range lines {
 			if strings.Contains(line, pattern) {
 				fmt.Fprintf(&b, "%s:%d: %s\n", file, i+1, line)
 				count++
-				if count >= maxGrepResults {
+				if count >= maxFindFileResults {
 					total := countRemainingMatches(pattern, file, lines[i+1:], pathMap)
 					fmt.Fprintf(&b, "... %d more matches omitted\n", total)
-					return b.String()
+					return true
 				}
 			}
 		}
+		return false
 	}
+
+	if scopeFile != "" {
+		key, _ := resolvePath(scopeFile, pathMap)
+		searchFile(key, pathMap[key])
+	} else {
+		for file, content := range pathMap {
+			if searchFile(file, content) {
+				break
+			}
+		}
+	}
+
 	if count == 0 {
 		return fmt.Sprintf("no matches found for %q", pattern)
 	}
-	logf("[exec] Grep %q: %d matches", pattern, count)
+	logf("[exec] FindFile %q: %d matches", pattern, count)
 	return b.String()
 }
 
